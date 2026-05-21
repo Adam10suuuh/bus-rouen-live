@@ -299,13 +299,16 @@ h1 {
   z-index: 620;
   top: 18px;
   right: 18px;
-  display: grid;
-  gap: 9px;
+  width: min(214px, calc(100vw - 36px));
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .map-floating-controls button {
-  min-width: 52px;
-  min-height: 46px;
+  min-width: 58px;
+  min-height: 38px;
   border: 1px solid color-mix(in srgb, var(--foreground) 9%, transparent);
   border-radius: 16px;
   padding: 0 12px;
@@ -331,6 +334,13 @@ h1 {
 
 .map-floating-controls span {
   color: var(--accent);
+}
+
+.map-floating-controls .is-active {
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--line));
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--accent), #0f766e);
+  box-shadow: 0 14px 34px rgba(8, 127, 91, 0.26);
 }
 
 .map-legend {
@@ -1687,15 +1697,16 @@ h1 {
   .map-floating-controls {
     top: 12px;
     right: 12px;
+    width: min(188px, calc(100vw - 24px));
     gap: 7px;
   }
 
   .map-floating-controls button {
-    min-width: 46px;
-    min-height: 42px;
+    min-width: 52px;
+    min-height: 34px;
     border-radius: 15px;
-    padding: 0 9px;
-    font-size: 0.7rem;
+    padding: 0 8px;
+    font-size: 0.66rem;
   }
 
   .map-legend {

@@ -1,7 +1,7 @@
 "use client";
 
-import { divIcon } from "leaflet";
-import { useEffect, useMemo, useState } from "react";
+import { divIcon, type Map as LeafletMap } from "leaflet";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   MapContainer,
   Marker,
@@ -9,11 +9,13 @@ import {
   Popup,
   TileLayer,
   useMap,
+  useMapEvents,
 } from "react-leaflet";
 
 const rouenCenter = { latitude: 49.4432, longitude: 1.0993 };
 const refreshIntervalMs = 30_000;
-const visibleStopsLimit = 900;
+const visibleStopsLimit = 220;
+const visibleVehiclesLimit = 180;
 const defaultHome = {
   latitude: 49.4429,
   longitude: 1.0885,
@@ -99,6 +101,23 @@ type SmartAlert = {
 
 type AlertPreferences = {
   enabled: boolean;
+};
+
+type MapBounds = {
+  north: number;
+  south: number;
+  east: number;
+  west: number;
+};
+
+type LayerFilters = {
+  bus: boolean;
+  teor: boolean;
+  metro: boolean;
+  stops: boolean;
+  metroStations: boolean;
+  favoritesOnly: boolean;
+  aroundMe: boolean;
 };
 
 type Vehicle = {
@@ -213,6 +232,17 @@ export function RouenMap() {
     useState<AlertPreferences>(getInitialAlertPreferences);
   const [alertsOpen, setAlertsOpen] = useState(false);
   const [sheetExpanded, setSheetExpanded] = useState(true);
+  const [mapBounds, setMapBounds] = useState<MapBounds | null>(null);
+  const [mapZoom, setMapZoom] = useState(13);
+  const [layerFilters, setLayerFilters] = useState<LayerFilters>({
+    bus: true,
+    teor: true,
+    metro: true,
+    stops: false,
+    metroStations: false,
+    favoritesOnly: false,
+    aroundMe: false,
+  });
   const [clockTick, setClockTick] = useState(() => Date.now());
   const [mapTarget, setMapTarget] = useState({
     latitude: rouenCenter.latitude,
@@ -272,7 +302,14 @@ export function RouenMap() {
         (vehicle) => vehicle.id === activeNavigation.recommendation.nextVehicle?.id,
       ) ?? activeNavigation.recommendation.nextVehicle
     : null;
-  const selectedTripId = selectedVehicle?.tripId ?? null;
+  const routePreviewVehicle =
+    selectedVehicle ??
+    (selectedLine
+      ? vehicles.find(
+          (vehicle) => vehicle.routeId === selectedLine && vehicle.tripId,
+        ) ?? null
+      : null);
+  const selectedTripId = routePreviewVehicle?.tripId ?? null;
   const hasSelectedVehicle = Boolean(selectedVehicleId);
 
   useEffect(() => {
@@ -445,20 +482,6 @@ export function RouenMap() {
   const referencePosition = userPosition ?? rouenCenter;
   const normalizedSearch = normalizeText(search);
 
-  const filteredStops = useMemo(() => {
-    return stops
-      .filter((stop) => {
-        const matchesLine =
-          !selectedLine || stop.lines.some((line) => line.name === selectedLine);
-        const matchesSearch =
-          !normalizedSearch ||
-          normalizeText(stop.name).includes(normalizedSearch);
-
-        return matchesLine && matchesSearch;
-      })
-      .slice(0, visibleStopsLimit);
-  }, [normalizedSearch, selectedLine, stops]);
-
   const favoriteStops = useMemo(() => {
     const stopById = new Map(stops.map((stop) => [stop.id, stop]));
 
@@ -477,18 +500,125 @@ export function RouenMap() {
       .slice(0, 5);
   }, [normalizedSearch, stops]);
 
-  const filteredVehicles = useMemo(() => {
-    if (!selectedLine) {
-      return vehicles;
-    }
+  const favoriteLineSet = useMemo(
+    () => new Set(favorites.lines),
+    [favorites.lines],
+  );
 
-    return vehicles.filter((vehicle) => vehicle.routeId === selectedLine);
-  }, [selectedLine, vehicles]);
+  const favoriteStopSet = useMemo(
+    () => new Set(favorites.stopIds),
+    [favorites.stopIds],
+  );
+
+  const filteredVehicles = useMemo(() => {
+    return vehicles
+      .filter(isVehicleInService)
+      .filter((vehicle) => {
+        if (selectedLine) {
+          return vehicle.routeId === selectedLine;
+        }
+
+        if (layerFilters.favoritesOnly && !favoriteLineSet.has(vehicle.routeId)) {
+          return false;
+        }
+
+        if (vehicle.routeType === "metro") {
+          return layerFilters.metro;
+        }
+
+        if (vehicle.routeType === "teor" || vehicle.routeType === "tram") {
+          return layerFilters.teor;
+        }
+
+        if (vehicle.routeType === "bus") {
+          return layerFilters.bus;
+        }
+
+        return layerFilters.bus;
+      });
+  }, [
+    favoriteLineSet,
+    layerFilters.bus,
+    layerFilters.favoritesOnly,
+    layerFilters.metro,
+    layerFilters.teor,
+    selectedLine,
+    vehicles,
+  ]);
 
   const vehiclesInRouenArea = useMemo(
     () => filteredVehicles.filter(isInRouenArea),
     [filteredVehicles],
   );
+
+  const viewportVehicles = useMemo(() => {
+    return vehiclesInRouenArea
+      .filter((vehicle) => isInMapBounds(vehicle, mapBounds))
+      .filter((vehicle) =>
+        layerFilters.aroundMe
+          ? getDistanceMeters(referencePosition, vehicle) <= 1_800
+          : true,
+      )
+      .slice(0, visibleVehiclesLimit);
+  }, [layerFilters.aroundMe, mapBounds, referencePosition, vehiclesInRouenArea]);
+
+  const filteredStops = useMemo(() => {
+    const shouldShowStops =
+      layerFilters.stops ||
+      layerFilters.metroStations ||
+      layerFilters.aroundMe ||
+      layerFilters.favoritesOnly ||
+      Boolean(selectedLine) ||
+      Boolean(normalizedSearch);
+
+    if (!shouldShowStops) {
+      return [];
+    }
+
+    return stops
+      .filter((stop) => isInMapBounds(stop, mapBounds))
+      .filter((stop) => {
+        const matchesLine =
+          !selectedLine || stop.lines.some((line) => line.name === selectedLine);
+        const matchesSearch =
+          !normalizedSearch ||
+          normalizeText(stop.name).includes(normalizedSearch);
+        const stopType = getStopType(stop);
+        const matchesMode =
+          selectedLine ||
+          normalizedSearch ||
+          (layerFilters.aroundMe &&
+            getDistanceMeters(referencePosition, stop) <= 1_100) ||
+          (layerFilters.favoritesOnly && favoriteStopSet.has(stop.id)) ||
+          (layerFilters.metroStations && stopType === "metro") ||
+          (layerFilters.stops && getZoomStopVisibility(stop, mapZoom));
+
+        return matchesLine && matchesSearch && Boolean(matchesMode);
+      })
+      .sort((left, right) => {
+        if (layerFilters.aroundMe) {
+          return (
+            getDistanceMeters(referencePosition, left) -
+            getDistanceMeters(referencePosition, right)
+          );
+        }
+
+        return right.lines.length - left.lines.length;
+      })
+      .slice(0, selectedLine || normalizedSearch ? 180 : visibleStopsLimit);
+  }, [
+    favoriteStopSet,
+    layerFilters.aroundMe,
+    layerFilters.favoritesOnly,
+    layerFilters.metroStations,
+    layerFilters.stops,
+    mapBounds,
+    mapZoom,
+    normalizedSearch,
+    referencePosition,
+    selectedLine,
+    stops,
+  ]);
 
   const nearestStops = useMemo(() => {
     return stops
@@ -507,19 +637,19 @@ export function RouenMap() {
       hasPrecisePosition: Boolean(userPosition),
       referencePosition,
       stops,
-      vehicles: vehiclesInRouenArea,
+      vehicles: viewportVehicles,
     });
-  }, [referencePosition, stops, userPosition, vehiclesInRouenArea]);
+  }, [referencePosition, stops, userPosition, viewportVehicles]);
 
   const nextVehicles = useMemo(() => {
-    return vehiclesInRouenArea
+    return viewportVehicles
       .map((vehicle) => ({
         ...vehicle,
         distance: getDistanceMeters(referencePosition, vehicle),
       }))
       .sort((left, right) => left.distance - right.distance)
       .slice(0, 4);
-  }, [referencePosition, vehiclesInRouenArea]);
+  }, [referencePosition, viewportVehicles]);
 
   const nextUsefulPassage = nearbyRecommendations.find(
     (recommendation) => recommendation.nextVehicle && recommendation.waitMinutes !== null,
@@ -530,9 +660,9 @@ export function RouenMap() {
       favoriteLines: favorites.lines,
       favoriteStops,
       referencePosition,
-      vehicles: vehiclesInRouenArea,
+      vehicles: viewportVehicles,
     });
-  }, [favoriteStops, favorites.lines, referencePosition, vehiclesInRouenArea]);
+  }, [favoriteStops, favorites.lines, referencePosition, viewportVehicles]);
 
   const tripPlan = useMemo(() => {
     return buildTripPlan({
@@ -540,9 +670,9 @@ export function RouenMap() {
       referencePosition,
       schoolPlace: favorites.places.school,
       stops,
-      vehicles: vehiclesInRouenArea,
+      vehicles: viewportVehicles,
     });
-  }, [favorites.places.school, referencePosition, schoolMode, stops, tripQuery, vehiclesInRouenArea]);
+  }, [favorites.places.school, referencePosition, schoolMode, stops, tripQuery, viewportVehicles]);
 
   const smartAlerts = useMemo(() => {
     return alertPreferences.enabled
@@ -599,9 +729,50 @@ export function RouenMap() {
     selectedLine,
     totalVehicles: vehicles.length,
     filteredVehicles: filteredVehicles.length,
-    visibleVehicles: vehiclesInRouenArea.length,
+    visibleVehicles: viewportVehicles.length,
     vehicleError,
   });
+
+  const updateMapViewport = useCallback((bounds: MapBounds, zoom: number) => {
+    setMapBounds(bounds);
+    setMapZoom(zoom);
+  }, []);
+
+  const toggleLayer = useCallback((key: keyof LayerFilters) => {
+    setLayerFilters((current) => ({
+      ...current,
+      [key]: !current[key],
+    }));
+  }, []);
+
+  const hideAllLayers = useCallback(() => {
+    setLayerFilters({
+      bus: false,
+      teor: false,
+      metro: false,
+      stops: false,
+      metroStations: false,
+      favoritesOnly: false,
+      aroundMe: false,
+    });
+    setSelectedLine("");
+    setSearch("");
+    setSelectedVehicleId(null);
+    setFollowedVehicleId(null);
+  }, []);
+
+  const showAroundMeOnly = useCallback(() => {
+    setLayerFilters({
+      bus: true,
+      teor: true,
+      metro: true,
+      stops: true,
+      metroStations: true,
+      favoritesOnly: false,
+      aroundMe: true,
+    });
+    focusAroundMe();
+  }, []);
 
   function focusPosition(position: Position, zoom = 16) {
     setMapTarget((target) => ({
@@ -625,6 +796,7 @@ export function RouenMap() {
           longitude: position.coords.longitude,
         };
         setUserPosition(nextPosition);
+        setLayerFilters((current) => ({ ...current, aroundMe: true }));
         focusPosition(nextPosition, 16);
       },
       () => focusPosition(referencePosition, 15),
@@ -1206,20 +1378,60 @@ export function RouenMap() {
       </aside>
 
       <div className="map-floating-controls" aria-label="Commandes carte">
-        <button type="button" onClick={focusAroundMe} aria-label="Ma position">
-          <span>GPS</span>
+        <button
+          className={layerFilters.bus ? "is-active" : ""}
+          type="button"
+          onClick={() => toggleLayer("bus")}
+        >
+          Bus
+        </button>
+        <button
+          className={layerFilters.teor ? "is-active" : ""}
+          type="button"
+          onClick={() => toggleLayer("teor")}
+        >
+          TEOR
+        </button>
+        <button
+          className={layerFilters.metro ? "is-active" : ""}
+          type="button"
+          onClick={() => toggleLayer("metro")}
+        >
+          Metro
+        </button>
+        <button
+          className={layerFilters.stops ? "is-active" : ""}
+          type="button"
+          onClick={() => toggleLayer("stops")}
+        >
+          Arrets
+        </button>
+        <button
+          className={layerFilters.metroStations ? "is-active" : ""}
+          type="button"
+          onClick={() => toggleLayer("metroStations")}
+        >
+          Stations M
+        </button>
+        <button
+          className={layerFilters.favoritesOnly ? "is-active" : ""}
+          type="button"
+          onClick={() => toggleLayer("favoritesOnly")}
+        >
+          Favoris
+        </button>
+        <button
+          className={layerFilters.aroundMe ? "is-active" : ""}
+          type="button"
+          onClick={showAroundMeOnly}
+        >
+          Autour
+        </button>
+        <button type="button" onClick={hideAllLayers}>
+          Masquer
         </button>
         <button type="button" onClick={() => focusPosition(rouenCenter, 13)}>
           Rouen
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            setSheetExpanded(true);
-            setSelectedLine("");
-          }}
-        >
-          Lignes
         </button>
         <button
           type="button"
@@ -1274,6 +1486,7 @@ export function RouenMap() {
         aria-label="Carte OpenStreetMap centree sur Rouen"
       >
         <MapRecenter target={mapTarget} />
+        <MapViewportTracker onChange={updateMapViewport} />
         <MapFollow
           vehicle={
             activeNavigation?.following
@@ -1285,14 +1498,14 @@ export function RouenMap() {
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
           url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
         />
-        {selectedVehicle && tripDetails?.shape.length ? (
+        {routePreviewVehicle && tripDetails?.shape.length ? (
           <Polyline
             positions={tripDetails.shape.map((point) => [
               point.latitude,
               point.longitude,
             ])}
             pathOptions={{
-              color: getRouteColor(selectedVehicle.routeType),
+              color: getRouteColor(routePreviewVehicle.routeType),
               opacity: 0.82,
               weight: 6,
             }}
@@ -1314,11 +1527,11 @@ export function RouenMap() {
                 : "Non renseigne"}
               <br />
               Prochains passages:{" "}
-              {formatStopPassages(buildStopPassages(stop, vehiclesInRouenArea), stop.lines)}
+              {formatStopPassages(buildStopPassages(stop, viewportVehicles), stop.lines)}
             </Popup>
           </Marker>
         ))}
-        {vehiclesInRouenArea.map((vehicle) => (
+        {viewportVehicles.map((vehicle) => (
           <Marker
             key={vehicle.id}
             position={[vehicle.latitude, vehicle.longitude]}
@@ -1670,6 +1883,38 @@ function MapFollow({ vehicle }: { vehicle: Vehicle | null }) {
   }, [map, vehicle]);
 
   return null;
+}
+
+function MapViewportTracker({
+  onChange,
+}: {
+  onChange: (bounds: MapBounds, zoom: number) => void;
+}) {
+  const map = useMapEvents({
+    moveend: () => {
+      onChange(getMapBounds(map), map.getZoom());
+    },
+    zoomend: () => {
+      onChange(getMapBounds(map), map.getZoom());
+    },
+  });
+
+  useEffect(() => {
+    onChange(getMapBounds(map), map.getZoom());
+  }, [map, onChange]);
+
+  return null;
+}
+
+function getMapBounds(map: LeafletMap): MapBounds {
+  const bounds = map.getBounds();
+
+  return {
+    north: bounds.getNorth(),
+    south: bounds.getSouth(),
+    east: bounds.getEast(),
+    west: bounds.getWest(),
+  };
 }
 
 function getInitialHome() {
@@ -2140,6 +2385,46 @@ function isInRouenArea(vehicle: Vehicle) {
     vehicle.latitude <= 49.65 &&
     vehicle.longitude >= 0.75 &&
     vehicle.longitude <= 1.45
+  );
+}
+
+function isVehicleInService(vehicle: Vehicle) {
+  return (
+    Number.isFinite(vehicle.latitude) &&
+    Number.isFinite(vehicle.longitude) &&
+    Boolean(vehicle.routeId && vehicle.routeId !== "Inconnue")
+  );
+}
+
+function isInMapBounds(position: Position, bounds: MapBounds | null) {
+  if (!bounds) {
+    return true;
+  }
+
+  return (
+    position.latitude <= bounds.north &&
+    position.latitude >= bounds.south &&
+    position.longitude <= bounds.east &&
+    position.longitude >= bounds.west
+  );
+}
+
+function getZoomStopVisibility(stop: Stop, zoom: number) {
+  if (zoom < 14) {
+    return false;
+  }
+
+  if (zoom < 16) {
+    return isMajorStop(stop);
+  }
+
+  return true;
+}
+
+function isMajorStop(stop: Stop) {
+  return (
+    stop.lines.length >= 4 ||
+    stop.lines.some((line) => line.type === "metro" || line.type === "teor")
   );
 }
 
